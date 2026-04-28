@@ -1,13 +1,13 @@
 name: HYROX Ticket Crawler
 
 on:
-  #schedule:
-  #  # Run every hour from 7:00 to 18:00 UTC (8am to 7pm Berlin time)
-  #  - cron: '0 6-18 * * *'
+  schedule:
+  # Run every hour from 7:00 to 18:00 UTC (8am to 7pm Berlin time)
+  - cron: '0 6-18 * * *'
   workflow_dispatch:  # Allow manual triggering
-  #push:
-  #  branches:
-  #    - main
+  push:
+   branches:
+    - main
 
 jobs:
   crawl-hyrox:
