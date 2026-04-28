@@ -1,168 +1,151 @@
 #!/usr/bin/env python3
-"""
-Simple web crawler to check for "Ticket sales start soon!" on HYROX Frankfurt website
-"""
+"""Web crawler that pings Discord when HYROX event ticket pages update."""
 
+import json
 import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import requests
 from bs4 import BeautifulSoup
-import sys
-from typing import Dict, List, Optional
 
-# Pushover API Configuration
-PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json"
-PUSHOVER_NOTIFICATION_TITLE = "HYROX Tickets Available!"
-PUSHOVER_DEFAULT_TITLE = "HYROX Crawler Alert"
-USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+)
 
+# Events to monitor: (display_name, url)
+EVENTS: List[Tuple[str, str]] = [
+    ("HYROX Valencia", "https://hyroxfrance.com/fr/event/hyrox-valencia/"),
+    (
+        "HYROX Nice (TrainSweatEat)",
+        "https://hyroxfrance.com/fr/event/trainsweateat-hyrox-nice/",
+    ),
+    ("HYROX Barcelona", "https://hyroxfrance.com/fr/event/hyrox-barcelona-2/"),
+    # Test event: tickets already live, first run will notify.
+    ("HYROX Geneva (test)", "https://hyroxfrance.com/fr/event/hyrox-geneva/"),
+]
 
-# We crawl until we don't find a term any more
-# Usually thats the indicator that the website was updated
-CRAWL_URL: str = os.getenv("CRAWL_URL", "https://hyrox.com/event/hyrox-frankfurt/")
+# When this term disappears from a page, the page has been updated and tickets
+# are likely live. See README for the rationale.
 SEARCH_TERM: str = os.getenv("SEARCH_TERM", "Ticket sales start soon!")
-PUSHOVER_USER_KEY: str | None = os.getenv("PUSHOVER_USER_KEY", None)
-PUSHOVER_APP_TOKEN: str | None = os.getenv("PUSHOVER_APP_TOKEN", None)
+DISCORD_WEBHOOK_URL: Optional[str] = os.getenv("DISCORD_WEBHOOK_URL")
 
-if not all([PUSHOVER_USER_KEY, PUSHOVER_APP_TOKEN]):
-    print("❌ Pushover credentials not provided - skipping notification")
-    sys.exit(0)
+# State file: URLs we've already pinged about, so we don't spam on every run.
+STATE_FILE: Path = Path(__file__).parent / "notified_events.json"
+
+# Kept so daily_status_ping.py (which imports from this module) still works.
+CRAWL_URL: str = os.getenv("CRAWL_URL", EVENTS[0][1])
 
 
-def send_pushover_notification(
-    user_key: str, app_token: str, message: str, title: str = PUSHOVER_DEFAULT_TITLE
-) -> bool:
-    """
-    Send a push notification via Pushover API
-
-    Args:
-        user_key (str): Pushover user key
-        app_token (str): Pushover application token
-        message (str): The message to send
-        title (str): The notification title
-
-    Returns:
-        bool: True if notification sent successfully, False otherwise
-    """
-    try:
-        data: Dict[str, str] = {
-            "token": app_token,
-            "user": user_key,
-            "message": message,
-            "title": title,
-        }
-
-        response: requests.Response = requests.post(
-            PUSHOVER_API_URL, data=data, timeout=10
-        )
-        response.raise_for_status()
-
-        result: Dict = response.json()
-        if result.get("status") == 1:
-            print("📱 Pushover notification sent successfully!")
-            return True
-        else:
-            print(f"❌ Pushover API error: {result.get('errors', 'Unknown error')}")
-            return False
-
-    except Exception as e:
-        print(f"❌ Failed to send Pushover notification: {e}")
+def send_discord(content: str, webhook_url: Optional[str] = None) -> bool:
+    """Post a message to a Discord webhook."""
+    url = webhook_url or DISCORD_WEBHOOK_URL
+    if not url:
+        print("❌ DISCORD_WEBHOOK_URL not set — skipping notification.")
         return False
+    try:
+        response = requests.post(url, json={"content": content}, timeout=10)
+        response.raise_for_status()
+        print("📬 Discord message posted.")
+        return True
+    except Exception as e:
+        print(f"❌ Discord post failed: {e}")
+        return False
+
+
+def load_state() -> Dict[str, str]:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception as e:
+        print(f"⚠️  Could not parse {STATE_FILE.name}: {e} — starting fresh.")
+        return {}
+
+
+def save_state(state: Dict[str, str]) -> None:
+    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
 def crawl_hyrox_website(
     url: str,
     search_term: str,
-    user_key: Optional[str] = None,
-    app_token: Optional[str] = None,
-) -> bool:
+    user_key: Optional[str] = None,   # unused, kept for backward compat
+    app_token: Optional[str] = None,  # unused, kept for backward compat
+) -> Optional[bool]:
+    """Fetch a page and check whether ``search_term`` is present.
+
+    Returns True if the term is missing (page likely updated → tickets may be live),
+    False if the term is still present, or None on error.
     """
-    Crawl the HYROX website and search for the specified term
-
-    Args:
-        url (str): The URL to crawl
-        search_term (str): The term to search for
-        user_key (str, optional): Pushover user key for notifications
-        app_token (str, optional): Pushover app token for notifications
-
-    Returns:
-        bool: True if term found, False otherwise
-    """
-
     try:
         print(f"🔍 Crawling: {url}")
-
         headers: Dict[str, str] = {"User-Agent": USER_AGENT}
-
-        response: requests.Response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-
-        print(f"✅ Successfully fetched the page (Status: {response.status_code})")
-
-        soup: BeautifulSoup = BeautifulSoup(response.content, "html.parser")
-
-        # Get all text content from the page
-        page_text: str = soup.get_text()
-
-        if search_term.lower() not in page_text.lower():
-            print(f"🎯 FOUND: '{search_term}' was found on the page!")
-
-            # Try to find the exact context where the term appears
-            lines: List[str] = page_text.split("\n")
-            context_line: str = ""
-            for i, line in enumerate(lines):
-                if search_term.lower() in line.lower():
-                    context_line = line.strip()
-                    print(f"📍 Context (line {i + 1}): {context_line}")
-                    break
-
-            # Send Pushover notification if credentials are provided
-            if user_key and app_token:
-                notification_message: str = f"🎉 HYROX Frankfurt tickets update!\n\nFound: '{search_term}'\nURL: {url}\nContext: {context_line}"
-                send_pushover_notification(
-                    user_key,
-                    app_token,
-                    notification_message,
-                    PUSHOVER_NOTIFICATION_TITLE,
-                )
-            else:
-                print("📱 Pushover credentials not provided - skipping notification")
-
-            return True
-        else:
-            print(f"❌ STILL PRESENT: '{search_term}' was found on the page.")
-            return False
-
+        page_text = BeautifulSoup(response.content, "html.parser").get_text()
+        return search_term.lower() not in page_text.lower()
     except requests.exceptions.RequestException as e:
-        print(f"❌ Error fetching the website: {e}")
-        return False
+        print(f"❌ Error fetching {url}: {e}")
+        return None
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-        return False
+        print(f"❌ Unexpected error on {url}: {e}")
+        return None
 
 
 def main() -> None:
-    """Main function to run the crawler"""
-
-    print("🏃‍♂️ HYROX Frankfurt Website Crawler")
+    print("🏃‍♂️ HYROX Ticket Crawler")
     print("=" * 50)
-    print(f"Target URL: {CRAWL_URL}")
     print(f"Searching for: '{SEARCH_TERM}'")
+    print(f"Events monitored: {len(EVENTS)}")
     print(
-        f"Pushover notifications: {'Enabled' if PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN else 'Disabled (missing credentials)'}"
+        "Discord: "
+        + ("Enabled" if DISCORD_WEBHOOK_URL else "Disabled (DISCORD_WEBHOOK_URL missing)")
     )
     print("=" * 50)
 
-    # Perform the crawl
-    found: bool = crawl_hyrox_website(
-        CRAWL_URL, SEARCH_TERM, PUSHOVER_USER_KEY, PUSHOVER_APP_TOKEN
-    )
+    if not DISCORD_WEBHOOK_URL:
+        print("❌ DISCORD_WEBHOOK_URL not provided — exiting.")
+        sys.exit(1)
+
+    state = load_state()
+    state_dirty = False
+    any_live = False
+
+    for name, url in EVENTS:
+        if url in state:
+            print(f"✅ {name}: already notified at {state[url]} — skipping.")
+            continue
+
+        result = crawl_hyrox_website(url, SEARCH_TERM)
+        if result is True:
+            any_live = True
+            print(f"🎉 {name}: '{SEARCH_TERM}' missing — page updated!")
+            sent = send_discord(
+                f"🎉 **{name}** — page updated, tickets may be live!\n{url}"
+            )
+            if sent:
+                state[url] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                state_dirty = True
+        elif result is False:
+            print(f"🚫 {name}: '{SEARCH_TERM}' still present.")
+        else:
+            print(f"⚠️  {name}: error during crawl.")
+
+    if state_dirty:
+        save_state(state)
+        print(f"💾 State updated: {STATE_FILE.name}")
 
     print("\n" + "=" * 50)
-    if found:
-        print("🎉 SUCCESS: The target term was not found!")
-        return
+    print(
+        "🚨 At least one event updated — check Discord."
+        if any_live
+        else "😴 No changes detected."
+    )
 
-    print("😞 RESULT: The target term was found.")
 
-
-main()
+if __name__ == "__main__":
+    main()
